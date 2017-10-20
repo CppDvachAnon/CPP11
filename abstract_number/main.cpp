@@ -7,154 +7,144 @@
 
 #define UNUSED_PARAM(x) ((void)(x))
 
+
 template<typename T>
 struct number
 {
-        virtual T inc() = 0;
         virtual T load() const = 0;
         virtual void store(T n) = 0;
-        virtual bool cond_store(T n, T& des) = 0;
+        virtual T fetch_add(T n) = 0;
+        virtual bool compare_and_swap(T val, T& expected) = 0;
 };
 
 template<typename T>
-struct atomic_number : public number<T>
+struct atomic_number : number<T>
 {
-        virtual T atomic_inc() = 0;
-        virtual T atomic_load() const = 0;
-        virtual void atomic_store(T n) = 0;
-        virtual bool compare_and_swap(T val, T& des) = 0;
-
-        T inc() override
-        {
-                return atomic_inc();
-        }
-
-        T load() const override
-        {
-                return atomic_load();
-        }
-
-        void store(T n) override
-        {
-                atomic_store(n);
-        }
-
-        bool cond_store(T n, T& des) override
-        {
-                return compare_and_swap(n, des);
-        }
-};
-
-template<typename T>
-struct my_atomic_number
-        : public atomic_number<T>
-{
-        explicit my_atomic_number(T i)
-                : i_(i)
+        explicit atomic_number(T n)
+                : n_(n)
         {}
 
-        T atomic_inc() final
+        T load() const final
         {
-                return i_.fetch_add(1, std::memory_order_seq_cst);
+                return n_.load();
         }
 
-        T atomic_load() const final
+        void store(T n) final
         {
-                return i_.load(std::memory_order_seq_cst);
+                n_.store(n);
         }
 
-        void atomic_store(T n) final
+        bool compare_and_swap(T val, T& expected) final
         {
-                i_.store(n, std::memory_order_seq_cst);
+                return n_.compare_exchange_weak(expected,
+                                                val);
         }
 
-        bool compare_and_swap(T val, T& des) final
+        T fetch_add(T n) final
         {
-                return i_.compare_exchange_strong(des,
-                                                  val,
-                                                  std::memory_order_seq_cst);
+                return n_.fetch_add(n);
         }
+
 
 private:
-        std::atomic<T> i_;
+        std::atomic<T> n_;
 };
 
-template<typename T>
-struct abstract_number;
 
-template<typename T>
-struct abstract_number_creator_interface
-{
-        virtual
-        std::shared_ptr<abstract_number<T>>
-        create_new(T val) = 0;
-};
-
-template<typename T>
+template<typename T, typename U = atomic_number<T>>
 struct abstract_number
-        : std::enable_shared_from_this<abstract_number<T>>
 {
-        abstract_number(std::shared_ptr<number<T>> n,
-                        std::shared_ptr<
-                                abstract_number_creator_interface<T>> creator)
-                : n_(n), creator_(creator)
+
+        explicit abstract_number(T val) :
+                n_(std::make_shared<typename std::decay<U>::type>(val)),
+                cow_(false)
+        {
+
+        }
+
+        abstract_number(const abstract_number& o) :
+                n_(o.n_), cow_(true)
         {
         }
 
-        std::shared_ptr<abstract_number<T>>
+        abstract_number(abstract_number&& o) noexcept :
+                n_(std::move(o.n_)), cow_(false)
+        {
+
+        }
+
+        abstract_number&
+        operator=(const abstract_number& o)
+        {
+                if(&o == this)
+                        return *this;
+
+                std::lock_guard<std::mutex> lock(cow_mtx_);
+                n_ = o.n_;
+                cow_ = true;
+
+                return *this;
+        }
+
+        abstract_number&
+        operator=(abstract_number&& o) noexcept
+        {
+                if(&o == this)
+                        return *this;
+
+                std::lock_guard<std::mutex> lock(cow_mtx_);
+                n_ = std::move(o.n_);
+                cow_ = false;
+
+                return *this;
+        }
+
+        abstract_number
         operator++(int)
         {
-                T cur = n_->load();
-                T des = cur + 1;
+                cow_check();
 
-                while(!n_->cond_store(des, cur))
-                {
-                        des = cur + 1;
-                }
+                abstract_number<T, U> tmp(*this);
 
-                auto prev = creator()->create_new(cur);
+                n_->fetch_add(1);
 
-                return prev;
+                return tmp;
         }
 
-        std::shared_ptr<abstract_number<T>>
+        abstract_number&
         operator++()
         {
-                T val = n_->inc();
+                cow_check();
 
-                return this->shared_from_this();
+                n_->fetch_add(1);
+
+                return *this;
         }
 
-        std::shared_ptr<abstract_number<T>>
-        operator=(std::shared_ptr<abstract_number<T>> other)
+
+        abstract_number&
+        operator+=(const abstract_number& b)
         {
-                if(this->shared_from_this() == other)
-                        return this->shared_from_this();
+                cow_check();
 
-                T val = other->value();
-                n_->store(val);
+                // We don't know dependencies of b here
+                // thus we can't be sure is changing b.val in between cas safe
+                // Ideally DCAS needed or mutex on both objects
 
-                return this->shared_from_this();
+                auto expected = this->value();
+                auto val = expected + b.value();
 
-        }
-
-        std::shared_ptr<abstract_number<T>>
-        operator+=(std::shared_ptr<abstract_number<T>> b)
-        {
-                T cur = n_->load();
-                T des = cur + b->value();
-
-                while(!n_->cond_store(des, cur))
+                while(!n_->compare_and_swap(val, expected))
                 {
-                        des = cur + b->value();
+                        val = expected + b.value();
                 }
 
-                return this->shared_from_this();
+                return *this;
         }
 
-        bool operator<=(std::shared_ptr<abstract_number<T>> b)
+        bool operator<=(const abstract_number& b) const
         {
-                return this->value() <= b->value();
+                return this->value() <= b.value();
         }
 
         T value() const
@@ -162,115 +152,62 @@ struct abstract_number
                 return n_->load();
         }
 
-        std::shared_ptr<abstract_number<T>>
-        copy()
+private:
+        void cow_check()
         {
-                return creator()->create_new(value());
-        }
+                if(!cow_)
+                        return;
 
-        std::shared_ptr<abstract_number_creator_interface<T>> creator()
-        {
-                return creator_;
+                std::lock_guard<std::mutex> lock(cow_mtx_);
+
+                n_ = std::make_shared<typename std::decay<U>::type>(value());
+                cow_ = false;
         }
 
 private:
         std::shared_ptr<number<T>> n_;
-        std::shared_ptr<abstract_number_creator_interface<T>> creator_;
+        std::atomic_bool cow_;
+        mutable std::mutex cow_mtx_;
 };
 
-template<typename T>
-struct number_creator
-{
-        std::shared_ptr<number<T>> create_new(T val)
-        {
-                return std::make_shared<my_atomic_number<T>>(val);
-        }
-};
 
 template<typename T>
-struct shared_abstract_number_creator :
-        abstract_number_creator_interface<T>,
-        std::enable_shared_from_this<shared_abstract_number_creator<T>>
+std::ostream& operator<<(std::ostream& os, const abstract_number<T>& n)
 {
-
-};
-
-template<typename T>
-struct abstract_number_creator :
-        public shared_abstract_number_creator<T>
-
-{
-        abstract_number_creator()
-                : ncreator_(std::make_shared<number_creator<T>>())
-        {}
-
-        std::shared_ptr<abstract_number<T>>
-        create_new(T val) override
-        {
-                std::unique_lock<std::mutex> lock(mtx_);
-
-                return std::make_shared<abstract_number<T>>(
-                                ncreator_->create_new(val),
-                                this->shared_from_this()
-                );
-        }
-
-private:
-        std::shared_ptr<number_creator<T>> ncreator_;
-        std::mutex mtx_;
-};
-
-template<typename T>
-std::ostream& operator<<(std::ostream& os, std::shared_ptr<abstract_number<T>> n)
-{
-        os << n->value();
+        os << n.value();
 
         return os;
 }
 
-template<typename T, typename X>
-void print_numbers(X n0, X n1, X s)
-{
-        static std::mutex mtx;
+static std::mutex stdout_mtx;
 
-        std::unique_lock<std::mutex> lock(mtx);
+template<typename T>
+void print_numbers(const abstract_number<T>& n0,
+                   const abstract_number<T>& n1,
+                   const abstract_number<T>& s)
+{
+        std::lock_guard<std::mutex> lock(stdout_mtx);
 
         std::cout<<"n0="<<n0<<" n1="<<n1<<" s="<<s<<std::endl;
 };
 
-
-template<typename T>
-static void sum(std::shared_ptr<abstract_number<T>> sum,
-                       std::shared_ptr<abstract_number<T>> n0,
-                       std::shared_ptr<abstract_number<T>> n1)
-{
-        auto number_creator = sum->creator();
-        auto s = number_creator->create_new(0);
-
-        s->operator=(n0);
-
-        while(n0->operator<=(n1)) {
-
-                print_numbers<T>(n0, n1, s);
-                s->operator+=(n0->operator++(1));
-        }
-
-
-        sum->operator=(s);
-}
-
+//#define NO_MT
 
 template<typename T>
 struct parallel_sum
 {
-        void operator()(std::shared_ptr<abstract_number<T>> sum,
-                     std::shared_ptr<abstract_number<T>> n0,
-                     std::shared_ptr<abstract_number<T>> n1)
+        void operator()(abstract_number<T> sum,
+                        abstract_number<T> n0,
+                        abstract_number<T> n1)
         {
                 std::vector<std::thread> pool;
+#if defined(NO_MT)
+                auto n = 1;
+#else
                 auto n = std::thread::hardware_concurrency();
+#endif
 
-                T slice = (n1->value() - n0->value()) / (T)n;
+                T slice = (n1.value() - n0.value()) / (T)n;
                 for(decltype(n) i = 0; i < n; ++i)
                 {
 
@@ -278,34 +215,37 @@ struct parallel_sum
                         T r = slice * (i + 1);
 
                         if(i + 1 == n)
-                                r = n1->value();
+                                r = n1.value();
 
 
                         auto my_elegant_modern_cpp11_lamda_function_for_extra_code_clarity =
-                        [](std::shared_ptr<abstract_number<T>> sum,
-                        std::shared_ptr<abstract_number<T>> n0,
-                        std::shared_ptr<abstract_number<T>> n1)
+                        [](abstract_number<T> sum,
+                        abstract_number<T> n0,
+                        abstract_number<T> n1)
                         {
-                                auto number_creator = sum->creator();
-                                auto s = number_creator->create_new(0);
+                                auto s = n0;
 
-                                s->operator=(n0);
-
-                                while(n0->operator<=(n1)) {
+                                while(n0 <= n1) {
 
                                         print_numbers<T>(n0, n1, s);
-                                        s->operator+=(n0->operator++(1));
+                                        s += n0++;
                                 }
 
 
-                                sum->operator=(s);
+                                sum = s;
                         };
 
-                        auto ln0 = n0->creator()->create_new(l);
-                        auto rn1 = n1->creator()->create_new(r);
+                        abstract_number<T> ln0(l);
+                        abstract_number<T> rn1(r);
 
+#if defined(NO_MT)
+                        my_elegant_modern_cpp11_lamda_function_for_extra_code_clarity(sum, ln0, rn1);
+#else
                         pool.push_back(std::thread(my_elegant_modern_cpp11_lamda_function_for_extra_code_clarity,
                                                    sum, ln0, rn1));
+#endif
+
+
                 }
 
                 for(auto& t : pool)
@@ -319,15 +259,13 @@ struct parallel_sum
 template<typename T>
 T do_shit()
 {
-        auto ncreator = std::make_shared<abstract_number_creator<T>>();
-
-        auto sum = ncreator->create_new(0);
-        auto n0  = ncreator->create_new(0);
-        auto n1  = ncreator->create_new(100);
+        abstract_number<T> sum (0);
+        abstract_number<T> n0  (0);
+        abstract_number<T> n1  (100);
 
         parallel_sum<T>()(sum, n0, n1);
 
-        return sum->value();
+        return sum.value();
 }
 
 
